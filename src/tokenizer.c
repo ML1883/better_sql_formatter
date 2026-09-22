@@ -25,79 +25,135 @@ char* clean_commas(const char* str) {
     return cleaned;
 }
 
+int add_token(Token **tokens, int *token_count, char *temp_string, unsigned int *char_counter,
+               int is_comment, unsigned int line_number, int *space_before) {
+    /* Voeg de token die in temp_string staat toe aan onze array. Return 0 als het geheugen op is. */
+    if (*char_counter == 0) {
+        return 1; //Niks om toe te voegen.
+    }
+    temp_string[*char_counter] = '\0';
+
+    *tokens = realloc(*tokens, ((*token_count) + 1) * sizeof(Token)); //Moet beter, maarja.
+    if (!*tokens) {
+        return 0;
+    }
+    (*tokens)[*token_count].value = strdup(temp_string);
+    (*tokens)[*token_count].raw_value = strdup(temp_string);
+    (*tokens)[*token_count].type = tokenize(temp_string, is_comment);
+    (*tokens)[*token_count].line_number = line_number;
+    (*tokens)[*token_count].length = strlen(temp_string);
+    (*tokens)[*token_count].raw_length = strlen(temp_string);
+    (*tokens)[*token_count].space_before = *space_before;
+
+    *token_count = (*token_count) + 1;
+    *char_counter = 0;
+    *space_before = 0;
+    return 1;
+}
+
 void find_possible_tokens(const char *input, Token **tokens, int *token_count) {
     // printf("tokenizing tokens\n");
 
     //Het kan lang worden
-    size_t length_input = strlen(input); //Iets om hier een out of bounds te vangen?
+    size_t length_input = strlen(input);
     unsigned int char_counter = 0;
-    
-    char *temp_string = malloc(1000 * sizeof(char));
+
+    //Een token kan nooit langer zijn dan de input zelf, dus zo kunnen we nooit buiten de buffer schrijven.
+    char *temp_string = malloc((length_input + 1) * sizeof(char));
     if (!temp_string) {
         return;
     }
 
     unsigned int line_number_temp = 0;
-    int is_comment = 0;
-    int is_in_ml_comment = 0;
-    int regel_nummer_line_comment = -1; 
-    //Simpele tokenizing voor nu; elke spatie en nieuweline is een nieuwe token
+    unsigned int token_line_number = 0;
+    int space_before = 0;
+    //Elke spatie en nieuweline is een nieuwe token. Strings en comments blijven wel in hun geheel een token,
+    //en haakjes, commas en puntkomma's zijn altijd een eigen token.
     for (size_t i = 0; i < length_input; i++) {
-        if (input[i] != ' ' && input[i] != '\n' && input[i] != '\r' && input[i] != '\t') {
-            // printf("Normale letter gevonden: %c  \n", input[i]);
-            temp_string[char_counter] = input[i];
-            char_counter++;
-        } else if (char_counter > 0) {
-            temp_string[char_counter] = '\0'; 
-            // printf("Spatie gevonden: %c \n", input[i]);
-            // printf("Token is: %s \n", temp_string);
-            // printf("ml comment is: %i \n", is_ml_comment);
-            // printf("tempstring[0] is: %c \n", temp_string[char_counter - 1]);
-            // printf("tempstring[1] is: %c \n", temp_string[char_counter]);
+        char c = input[i];
 
-            *tokens = realloc(*tokens, ((*token_count) + 1) * sizeof(Token)); //Moet beter, maarja.
-            if (!*tokens) {
-                free(temp_string);
-                return; 
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+            if (!add_token(tokens, token_count, temp_string, &char_counter, 0, token_line_number, &space_before)) break;
+            space_before = 1;
+            if (c == '\n') {
+                line_number_temp++;
             }
-            if (char_counter > 1 && temp_string[0] == '/' && temp_string[1] == '*')  { //Dit dekt niet 1 woord ML comments.
-                is_comment = 1;
-                is_in_ml_comment = 1;
-                
-            } 
-            if (char_counter > 1 && temp_string[0] == '-' && temp_string[1] == '-')  { 
-                regel_nummer_line_comment = line_number_temp;
-                is_comment = 1;
-            }
-            (*tokens)[*token_count].value = clean_commas(strdup(temp_string));
-            (*tokens)[*token_count].raw_value = strdup(temp_string);
-            (*tokens)[*token_count].type = tokenize(temp_string, is_comment);
-            (*tokens)[*token_count].line_number = line_number_temp;
-            (*tokens)[*token_count].length = strlen(clean_commas(temp_string));
-            (*tokens)[*token_count].raw_length = strlen(temp_string);
-
-            if (char_counter > 1 && temp_string[char_counter - 2] == '*' && temp_string[char_counter - 1] == '/')  {
-                is_comment = 0;
-                is_in_ml_comment = 0;
-            }
-            if(input[i] == '\n' || input[i] == '\r' ) {
-                //Line number plussen aan het einde omdat we anders het laatste woord van de zin niet correct categoriseren.
-                line_number_temp++;  
-            }
-            if (regel_nummer_line_comment != -1 
-                && line_number_temp > regel_nummer_line_comment //+1 omdat we anders de line number niet correct benaderen 
-                && is_in_ml_comment == 0)  { 
-                is_comment = 0;
-            }
-
-            *token_count = (*token_count) + 1;
-            char_counter = 0;
-            memset(temp_string, 0, 1000);
-           
+            continue;
         }
 
+        // Een -- comment loopt tot het einde van de regel.
+        if (c == '-' && input[i + 1] == '-') {
+            if (!add_token(tokens, token_count, temp_string, &char_counter, 0, token_line_number, &space_before)) break;
+            token_line_number = line_number_temp;
+            while (i < length_input && input[i] != '\n' && input[i] != '\r') {
+                temp_string[char_counter++] = input[i++];
+            }
+            while (char_counter > 0 && (temp_string[char_counter - 1] == ' ' || temp_string[char_counter - 1] == '\t')) {
+                char_counter--; //Spaties aan het einde van de comment doen er niet toe.
+            }
+            if (!add_token(tokens, token_count, temp_string, &char_counter, 1, token_line_number, &space_before)) break;
+            i--; //Zodat de enter zelf ook weer door de loop verwerkt wordt.
+            continue;
+        }
+
+        // Een /* comment loopt tot de */, ook over meerdere regels heen.
+        if (c == '/' && input[i + 1] == '*') {
+            if (!add_token(tokens, token_count, temp_string, &char_counter, 0, token_line_number, &space_before)) break;
+            token_line_number = line_number_temp;
+            temp_string[char_counter++] = input[i++];
+            temp_string[char_counter++] = input[i++];
+            while (i < length_input && !(input[i] == '*' && input[i + 1] == '/')) {
+                if (input[i] == '\n') {
+                    line_number_temp++;
+                }
+                temp_string[char_counter++] = input[i++];
+            }
+            if (i < length_input) {
+                temp_string[char_counter++] = input[i++];
+                temp_string[char_counter++] = input[i];
+            }
+            if (!add_token(tokens, token_count, temp_string, &char_counter, 1, token_line_number, &space_before)) break;
+            continue;
+        }
+
+        // Haakjes, commas en puntkomma's zijn altijd een losse token.
+        if (c == '(' || c == ')' || c == ',' || c == ';') {
+            if (!add_token(tokens, token_count, temp_string, &char_counter, 0, token_line_number, &space_before)) break;
+            token_line_number = line_number_temp;
+            temp_string[char_counter++] = c;
+            if (!add_token(tokens, token_count, temp_string, &char_counter, 0, token_line_number, &space_before)) break;
+            continue;
+        }
+
+        if (char_counter == 0) {
+            token_line_number = line_number_temp;
+        }
+        temp_string[char_counter++] = c;
+
+        // Alles tussen quotes (of blokhaken) hoort bij dezelfde token, inclusief spaties en enters.
+        if (c == '\'' || c == '"' || c == '`' || c == '[') {
+            char closing = (c == '[') ? ']' : c;
+            i++;
+            while (i < length_input) {
+                temp_string[char_counter++] = input[i];
+                if (input[i] == '\n') {
+                    line_number_temp++;
+                }
+                if (input[i] == closing) {
+                    if (closing != ']' && input[i + 1] == closing) { //Twee quotes achter elkaar is een escape, geen einde.
+                        i++;
+                        temp_string[char_counter++] = input[i];
+                    } else {
+                        break;
+                    }
+                }
+                i++;
+            }
+        }
     }
-    
+    //De laatste token toevoegen, ook als het bestand niet met witruimte eindigt.
+    add_token(tokens, token_count, temp_string, &char_counter, 0, token_line_number, &space_before);
+
     free(temp_string);
 
 }
@@ -121,7 +177,8 @@ TokenType tokenize(const char *input, int is_comment) {
         "SELECT", "FROM", "WHERE", "INSERT", "UPDATE", "DELETE", 
         "CREATE", "DROP", "ALTER", "JOIN", "ON", "GROUP", "ORDER",
         "LEFT", "RIGHT", "INNER", "BY", "AS", "INTO", "WITH", "UNION",
-        "LIMIT", "OFFSET", "HAVING", NULL
+        "LIMIT", "OFFSET", "HAVING", "FULL", "OUTER", "CROSS", "USE",
+        "CASE", "WHEN", "THEN", "ELSE", "END", "BETWEEN", "DISTINCT", "ASC", "DESC", NULL
     };
     
 

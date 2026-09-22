@@ -6,9 +6,15 @@
 #include <formatter.h>
 #include <ctype.h>
 
+// Hoeveel niveaus we extra inspringen omdat we in een subquery zitten.
+static int base_indentation = 0;
+// Hebben we net een -- comment geschreven? Dan moet de volgende token op een nieuwe regel, anders commenten we code weg.
+static int line_comment_open = 0;
+static size_t line_comment_end = 0;
+
 //Om tabjes te inserten van 4 maal spatie
 void add_indentation(char* result, size_t* pos, int level) {
-    for (int i = 0; i < level * 4; i++) {
+    for (int i = 0; i < (base_indentation + level) * 4; i++) {
         result[(*pos)++] = ' ';
     }
 }
@@ -28,266 +34,334 @@ char* to_uppercase(const char* str) {
     return upperStr;
 }
 
+int is_at_line_start(const char* result, size_t pos) {
+    // Staan er op de huidige regel alleen nog maar spaties?
+    while (pos > 0 && result[pos - 1] == ' ') {
+        pos--;
+    }
+    return pos == 0 || result[pos - 1] == '\n';
+}
+
+void ensure_newlines(char* result, size_t* pos, int amount) {
+    // Zorg dat de output eindigt op minimaal amount enters. Aan het begin van de output doen we niks.
+    while (*pos > 0 && result[*pos - 1] == ' ') {
+        (*pos)--;
+    }
+    if (*pos == 0) {
+        return;
+    }
+    int present = 0;
+    while ((size_t)present < *pos && result[*pos - 1 - present] == '\n') {
+        present++;
+    }
+    for (; present < amount; present++) {
+        *pos += sprintf(result + *pos, "\n");
+    }
+}
+
+void write_token(Token* tokens, int i, char* result, size_t* pos) {
+    /* Schrijft een enkele token weg. ALLE tokens moeten via deze functie de output in, zo raken we nooit tekst kwijt.
+    Een spatie ervoor zetten we alleen als die er in het origineel ook stond.*/
+    int own_line_comment = tokens[i].type == TOKEN_COMMENT && i > 0
+                           && tokens[i].line_number > tokens[i - 1].line_number;
+    int comment_still_open = line_comment_open
+                             && memchr(result + line_comment_end, '\n', *pos - line_comment_end) == NULL;
+
+    if ((own_line_comment || comment_still_open) && !is_at_line_start(result, *pos)) {
+        // Nieuwe regel met dezelfde inspringing als de huidige regel.
+        size_t line_start = *pos;
+        while (line_start > 0 && result[line_start - 1] != '\n') {
+            line_start--;
+        }
+        int spaces = 0;
+        while (line_start + spaces < *pos && result[line_start + spaces] == ' ') {
+            spaces++;
+        }
+        *pos += sprintf(result + *pos, "\n");
+        for (int s = 0; s < spaces; s++) {
+            result[(*pos)++] = ' ';
+        }
+    }
+    line_comment_open = 0;
+
+    if (tokens[i].space_before && *pos > 0 && result[*pos - 1] != ' ' && result[*pos - 1] != '\n'
+        && !(result[*pos - 1] == ',' && is_at_line_start(result, *pos - 1))) { //Geen spatie na een comma aan het begin van de regel
+        *pos += sprintf(result + *pos, " ");
+    }
+
+    if (tokens[i].type == TOKEN_KEYWORD || tokens[i].type == TOKEN_OPERATOR) {
+        char* uppercase_value = to_uppercase(tokens[i].raw_value);
+        *pos += sprintf(result + *pos, "%s", uppercase_value);
+        free(uppercase_value);
+    } else {
+        *pos += sprintf(result + *pos, "%s", tokens[i].raw_value);
+    }
+
+    if (tokens[i].type == TOKEN_COMMENT && tokens[i].raw_value[0] == '-') {
+        line_comment_open = 1;
+        line_comment_end = *pos;
+    }
+}
+
+int is_open_parenthesis(Token* tokens, int i) {
+    return tokens[i].type == TOKEN_PARENTHESIS && tokens[i].raw_value[0] == '(';
+}
+
+int is_close_parenthesis(Token* tokens, int i) {
+    return tokens[i].type == TOKEN_PARENTHESIS && tokens[i].raw_value[0] == ')';
+}
+
+int find_closing_parenthesis(Token* tokens, int start_idx, int end_idx) {
+    // Geeft de index van het bijbehorende sluitende haakje, of -1 als die er niet is.
+    int depth = 0;
+    for (int i = start_idx; i <= end_idx; i++) {
+        if (is_open_parenthesis(tokens, i)) {
+            depth++;
+        } else if (is_close_parenthesis(tokens, i)) {
+            depth--;
+            if (depth == 0) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+int is_subquery_start(Token* tokens, int idx, int end_idx) {
+    // Is dit een haakje openen met direct (eventueel na comments) een SELECT of WITH erachter?
+    if (!is_open_parenthesis(tokens, idx)) {
+        return 0;
+    }
+    int next = idx + 1;
+    while (next <= end_idx && tokens[next].type == TOKEN_COMMENT) {
+        next++;
+    }
+    if (next > end_idx) {
+        return 0;
+    }
+    return strcasecmp(tokens[next].value, "SELECT") == 0 || strcasecmp(tokens[next].value, "WITH") == 0;
+}
+
+int format_subquery(Token* tokens, int start_idx, int end_idx, char* result, size_t* pos, int level) {
+    /* Schrijft een subquery tussen haakjes uit als volledig geformatteerd blok.
+    level is de inspringing van de regel waar het haakje op staat. Return de index van de laatst geschreven token.*/
+    int close_idx = find_closing_parenthesis(tokens, start_idx, end_idx);
+    int inner_end = (close_idx == -1) ? end_idx : close_idx - 1;
+
+    write_token(tokens, start_idx, result, pos);
+    base_indentation += level + 1;
+    format_statements(tokens, start_idx + 1, inner_end, result, pos);
+    base_indentation -= level + 1;
+
+    if (close_idx == -1) {
+        return end_idx;
+    }
+    ensure_newlines(result, pos, 2);
+    add_indentation(result, pos, level);
+    write_token(tokens, close_idx, result, pos);
+    return close_idx;
+}
+
+int format_inline_subquery(Token* tokens, int start_idx, int end_idx, char* result, size_t* pos, int level) {
+    /* Schrijft een subquery tussen haakjes uit op een eigen regel, maar verder zoals die er staat.
+    Return de index van de laatst geschreven token.*/
+    int close_idx = find_closing_parenthesis(tokens, start_idx, end_idx);
+    int inner_end = (close_idx == -1) ? end_idx : close_idx - 1;
+
+    write_token(tokens, start_idx, result, pos);
+    *pos += sprintf(result + *pos, "\n");
+    add_indentation(result, pos, level + 1);
+    for (int i = start_idx + 1; i <= inner_end; i++) {
+        write_token(tokens, i, result, pos);
+    }
+
+    if (close_idx == -1) {
+        return end_idx;
+    }
+    *pos += sprintf(result + *pos, "\n");
+    add_indentation(result, pos, level);
+    write_token(tokens, close_idx, result, pos);
+    return close_idx;
+}
+
 
 void format_select_section(Token* tokens, int start_idx, int end_idx, char* result, size_t* pos, const char* keyword) {
     /*Deze functie is niet alleen voor select onderdelen, maar alles wat erop lijkt. 
     Daarom heeft het ook het keyword nodig.*/
-    *pos += sprintf(result + *pos, "%s", keyword); 
-    // Ga vervolgens door de items van de select heen
-    int item_number = 1;
-    int in_case_block = 0;
-    char *uppercase_value = malloc(1000 * sizeof(char));
-    char *prev_uppercase_value = malloc(1000 * sizeof(char));
-    if (!uppercase_value && !prev_uppercase_value) {
-        perror("Error: Memory allocation failed\n");
-    }
+    add_indentation(result, pos, 0);
+    *pos += sprintf(result + *pos, "%s", keyword);
+    // Ga vervolgens door de items van de select heen. Een nieuw item begint alleen bij een comma buiten haakjes.
+    int depth = 0;
 
     for (int i = start_idx; i <= end_idx; i++) {
-        
-        
-    
-    
-        if (tokens[i].type ==  TOKEN_COMMENT) {
-            i += format_comments(tokens, i, end_idx, result, pos);
-        }
-        if (i > end_idx) {
-            break; //As we zojuist met code over het einde van de laatste token zijn gegaan, moeten we snel kappen.
-        }
-        free(uppercase_value);
-        uppercase_value = to_uppercase(tokens[i].value);
-        // Als we een case hebben moeten we daar speciaal mee omgaan. 
-        if (strcmp(uppercase_value, "CASE") == 0) {
-            i += format_case_block(tokens, i, end_idx, result, pos, &item_number, 1);
-            item_number++;
+        if (i == start_idx) {
+            *pos += sprintf(result + *pos, "\n");
+            add_indentation(result, pos, 1);
+        } else if (depth == 0 && tokens[i].type == TOKEN_COMMA) {
+            // Comments die achter de comma stonden, horen nog bij het vorige item.
+            int comma_idx = i;
+            while (i + 1 <= end_idx && tokens[i + 1].type == TOKEN_COMMENT) {
+                i++;
+                write_token(tokens, i, result, pos);
+            }
+            *pos += sprintf(result + *pos, "\n");
+            add_indentation(result, pos, 1);
+            write_token(tokens, comma_idx, result, pos);
             continue;
         }
-        if (i > end_idx) {
-            break; //As we zojuist met code over het einde van de laatste token zijn gegaan, moeten we snel kappen.
-        }
-        free(uppercase_value);
-        uppercase_value = to_uppercase(tokens[i].value);
-        if (i > start_idx) { 
-            free(prev_uppercase_value);
-            prev_uppercase_value = to_uppercase(tokens[i-1].value);
-        }
-        // printf("Current value of I is: %i \n", i);
 
-
-        if (strstr(tokens[i].value, "(") != NULL) {
-            if (item_number > 1 && tokens[i].raw_value[0] != ',') {
-                *pos += sprintf(result + *pos, "\n");
-                add_indentation(result, pos, 1);
-                *pos += sprintf(result + *pos, ",%s ", tokens[i].raw_value); //raw appendage when in curly brackets.
-            } else {
-                *pos += sprintf(result + *pos, "\n");
-                add_indentation(result, pos, 1);
-                *pos += sprintf(result + *pos, " %s", tokens[i].raw_value); //raw appendage when in curly brackets.
-            }
-            item_number++;
-            if (strstr(tokens[i].value, ")") != NULL 
-                && strstr(strdup(to_uppercase(tokens[i].raw_value)), "ROW_NUMBER") == NULL) {
-                // printf("Open en einde gevonden voor string: %s \n", tokens[i].raw_value);
-                continue;
-            } else {
-                i++;
-                while(strstr(tokens[i].value, ")") == NULL) {
-                    *pos += sprintf(result + *pos, " %s", tokens[i].raw_value); //raw appendage when in curly brackets.
-                    i++;
-                    item_number++;
-                }        // unsigned int loop_counter = 0;
-        // printf("Raw value being checked: %s \n", tokens[i].raw_value);
-                continue;
-            }
-            
+        // Als we een case hebben moeten we daar speciaal mee omgaan.
+        if (depth == 0 && strcasecmp(tokens[i].value, "CASE") == 0) {
+            i += format_case_block(tokens, i, end_idx, result, pos, 1) - 1;
+            continue;
         }
 
-        if (tokens[i].type != TOKEN_KEYWORD || 
-            strcmp(uppercase_value, "AS") == 0) {
-
-            if (tokens[i].type == TOKEN_IDENTIFIER || tokens[i].type == TOKEN_SELECTITEM) {
-                //Hebben we een identifier of een select item? dan handelen we dat hier
-                if (prev_uppercase_value && strcmp(prev_uppercase_value, "AS") == 0 ) {
-                    *pos += sprintf(result + *pos, " %s", tokens[i].value); //Als die identifier na een as komt, moeten we t op deze manier aanpakken.
-                } else if (item_number > 1) {
-                    *pos += sprintf(result + *pos, "\n");
-                    add_indentation(result, pos, 1);
-                    *pos += sprintf(result + *pos, ",%s", tokens[i].value);
-                } 
-                else {
-                    *pos += sprintf(result + *pos, "\n");
-                    add_indentation(result, pos, 1);
-                    *pos += sprintf(result + *pos, " %s", tokens[i].value);
-                }
-                
-                item_number++;
-                
-            } else {
-                *pos += sprintf(result + *pos, " %s", tokens[i].value);
-            }
-        } else {
-                *pos += sprintf(result + *pos, "%s ", tokens[i].raw_value);
+        if (is_open_parenthesis(tokens, i)) {
+            depth++;
+        } else if (is_close_parenthesis(tokens, i)) {
+            depth--;
         }
-        
+        write_token(tokens, i, result, pos);
     }
-    free(uppercase_value);
-    free(prev_uppercase_value);
     *pos += sprintf(result + *pos, "\n");
     *pos += sprintf(result + *pos, "\n");
-    
+
 }
 
 void format_from_section(Token* tokens, int start_idx, int end_idx, char* result, size_t* pos) {
     //Hieronder de code om de from section te handelen
+    add_indentation(result, pos, 0);
     *pos += sprintf(result + *pos, "FROM\n");
     add_indentation(result, pos, 1);
-    
-    bool in_join = false;
-    bool first_table_done = false;
+
     bool join_type_found = false;
+    bool between_found = false;
     int join_level = 1;
-    char *uppercase_value = malloc(1000 * sizeof(char));
-    if (!uppercase_value) {
-        perror("Error: Memory allocation failed\n");
-    }
+    int depth = 0;
+    int prev_idx = -1; //Vorige token die geen comment is
 
     for (int i = start_idx; i <= end_idx; i++) {
-        if (tokens[i].type ==  TOKEN_COMMENT) {
-            i += format_comments(tokens, i, end_idx, result, pos);
+        if (tokens[i].type == TOKEN_COMMENT) {
+            write_token(tokens, i, result, pos);
+            continue;
         }
-        if (i > end_idx) {
-            break; //As we zojuist met code over het einde van de laatste token zijn gegaan, moeten we snel kappen.
-        }
-        free(uppercase_value);
-        uppercase_value = to_uppercase(tokens[i].value);
-        
-        if (strcmp(uppercase_value, "CASE") == 0) {
-                int item_number = 0;
-                i += format_case_block(tokens, i, end_idx, result, pos, &item_number, 2);
-        }
-        if (i > end_idx) {
-            break; //As we zojuist met code over het einde van de laatste token zijn gegaan, moeten we snel kappen.
-        }
+        const char* value = tokens[i].value;
 
-        free(uppercase_value);
-        uppercase_value = to_uppercase(tokens[i].value);
-        if (tokens[i].type == TOKEN_KEYWORD) {
-            // Handelen van het keywoord as voor de eerste tabel dus de from.
-            if (strcmp(uppercase_value, "AS") == 0 && first_table_done) {
-                *pos += sprintf(result + *pos, "%s ", uppercase_value);
+        if (depth == 0) {
+            // Een subquery als tabel schrijven we volledig uit.
+            if (is_subquery_start(tokens, i, end_idx)
+                && (prev_idx == -1 || strcasecmp(tokens[prev_idx].value, "JOIN") == 0
+                    || strcasecmp(tokens[prev_idx].value, "LATERAL") == 0
+                    || strcasecmp(tokens[prev_idx].value, "APPLY") == 0
+                    || tokens[prev_idx].type == TOKEN_COMMA)) {
+                i = format_subquery(tokens, i, end_idx, result, pos, join_level);
+                prev_idx = i;
+                continue;
+            }
+            prev_idx = i;
+
+            if (strcasecmp(value, "CASE") == 0) {
+                i += format_case_block(tokens, i, end_idx, result, pos, join_level + 1) - 1;
+                prev_idx = i;
                 continue;
             }
             // Handelen van left right inner and outer
-            if (strcmp(uppercase_value, "LEFT") == 0 || 
-                strcmp(uppercase_value, "RIGHT") == 0 || 
-                strcmp(uppercase_value, "INNER") == 0 || 
-                strcmp(uppercase_value, "OUTER") == 0 ||
-                strcmp(uppercase_value, "FULL") == 0) {
-                if(join_type_found) { //Als we een FULL OUTER doen of dergelijke, willen we niet dat dit zorgt voor meer enters.
-                    add_indentation(result, pos, join_level);
-                    *pos += sprintf(result + *pos, "%s ", uppercase_value);
-                    join_type_found = true;
-                } else {
+            if (strcasecmp(value, "LEFT") == 0 ||
+                strcasecmp(value, "RIGHT") == 0 ||
+                strcasecmp(value, "INNER") == 0 ||
+                strcasecmp(value, "OUTER") == 0 ||
+                strcasecmp(value, "FULL") == 0 ||
+                strcasecmp(value, "CROSS") == 0) {
+                if (!join_type_found) { //Als we een FULL OUTER doen of dergelijke, willen we niet dat dit zorgt voor meer enters.
                     *pos += sprintf(result + *pos, "\n\n");
                     add_indentation(result, pos, join_level);
-                    *pos += sprintf(result + *pos, "%s ", uppercase_value);
-                    join_type_found = true;
                 }
-                
+                write_token(tokens, i, result, pos);
+                join_type_found = true;
+                continue;
             }
             // Handelen van join keyword
-            else if (strcmp(uppercase_value, "JOIN") == 0) {
+            if (strcasecmp(value, "JOIN") == 0) {
                 if (!join_type_found) {
-                    *pos += sprintf(result + *pos, "\n");
+                    *pos += sprintf(result + *pos, "\n\n");
                     add_indentation(result, pos, join_level);
                 }
-                *pos += sprintf(result + *pos, "%s ", uppercase_value);
-                in_join = true;
+                write_token(tokens, i, result, pos);
                 join_type_found = false;
+                continue;
             }
-            // On keyword te handelen
-            else if (strcmp(uppercase_value, "ON") == 0) {
+            // On keyword en AND/OR in de join conditie
+            if (strcasecmp(value, "BETWEEN") == 0) {
+                between_found = true;
+            } else if (strcasecmp(value, "ON") == 0 ||
+                       ((strcasecmp(value, "AND") == 0 && !between_found) || strcasecmp(value, "OR") == 0)) {
                 *pos += sprintf(result + *pos, "\n");
                 add_indentation(result, pos, join_level + 1);
-                *pos += sprintf(result + *pos, "%s ", uppercase_value);
-            } else {
-                *pos += sprintf(result + *pos, "%s ", tokens[i].value);
-            }
-        } else if (tokens[i].type == TOKEN_IDENTIFIER) {
-            *pos += sprintf(result + *pos, "%s ", tokens[i].value);
-            
-            // Voeg een nieuwe line in na de eerste table definitie (inclusief de alias
-            if (!first_table_done && !in_join) {
-                if (i + 1 >= end_idx || 
-                    (tokens[i + 1].type != TOKEN_IDENTIFIER && 
-                     (tokens[i + 1].type != TOKEN_KEYWORD || 
-                      strcmp(to_uppercase(tokens[i + 1].value), "AS") == 0))) {
-                    //*pos += sprintf(result + *pos, "\n");
-                    first_table_done = true;
-                }
-            }
-
-        } else if (tokens[i].type == TOKEN_OPERATOR) {
-            if(strcmp(uppercase_value, "AND") == 0 || strcmp(uppercase_value, "OR") == 0) {
+                write_token(tokens, i, result, pos);
+                continue;
+            } else if (strcasecmp(value, "AND") == 0) {
+                between_found = false; //Dit is de AND van de BETWEEN, die blijft op dezelfde regel.
+            } else if (tokens[i].type == TOKEN_COMMA) {
                 *pos += sprintf(result + *pos, "\n");
-                add_indentation(result, pos, join_level + 1);
-                *pos += sprintf(result + *pos, "%s ", uppercase_value);
-            } else {
-                *pos += sprintf(result + *pos, "%s ", uppercase_value);
+                add_indentation(result, pos, join_level);
+                write_token(tokens, i, result, pos);
+                continue;
             }
-        } else {
-            *pos += sprintf(result + *pos, "%s ", tokens[i].raw_value);
         }
+        prev_idx = i;
+
+        if (is_open_parenthesis(tokens, i)) {
+            depth++;
+        } else if (is_close_parenthesis(tokens, i)) {
+            depth--;
+        }
+        write_token(tokens, i, result, pos);
     }
     *pos += sprintf(result + *pos, "\n\n");
-    free(uppercase_value);
 }
 
 
 void format_where_section(Token* tokens, int start_idx, int end_idx, char* result, size_t* pos) {
+    add_indentation(result, pos, 0);
     *pos += sprintf(result + *pos, "WHERE\n");
     add_indentation(result, pos, 1);
-    
-    bool new_condition = false;
-    char *uppercase_value = malloc(1000 * sizeof(char));
-    if (!uppercase_value) {
-        perror("Error: Memory allocation failed\n");
-    }
-    
-    for (int i = start_idx; i <= end_idx; i++) {
-        if (tokens[i].type ==  TOKEN_COMMENT) {
-            i += format_comments(tokens, i, end_idx, result, pos);
-        }
-        free(uppercase_value);
-        uppercase_value = to_uppercase(tokens[i].value);
-        if (i > end_idx) {
-            break; //As we zojuist met code over het einde van de laatste token zijn gegaan, moeten we snel kappen.
-        }
-        if (strcmp(uppercase_value, "CASE") == 0) {
-            int item_number = 0;
-            i += format_case_block(tokens, i, end_idx, result, pos, &item_number, 1);
-        }
-        if (i > end_idx) {
-            break; //As we zojuist met code over het einde van de laatste token zijn gegaan, moeten we snel kappen.
-        }
 
-        free(uppercase_value);
-        uppercase_value = to_uppercase(tokens[i].value); //Als we een paar blokken zijn opgeschoten, moeten we dit aanpassen.
-        if (tokens[i].type == TOKEN_OPERATOR) {
-            if (strcmp(uppercase_value, "AND") == 0 || strcmp(uppercase_value, "OR") == 0) {
+    bool between_found = false;
+    int depth = 0;
+
+    for (int i = start_idx; i <= end_idx; i++) {
+        const char* value = tokens[i].value;
+
+        if (depth == 0) {
+            // Subqueries in de where (EXISTS, IN) komen op hun eigen regel.
+            if (is_subquery_start(tokens, i, end_idx)) {
+                i = format_inline_subquery(tokens, i, end_idx, result, pos, 1);
+                continue;
+            }
+            if (strcasecmp(value, "CASE") == 0) {
+                i += format_case_block(tokens, i, end_idx, result, pos, 1) - 1;
+                continue;
+            }
+            if (strcasecmp(value, "BETWEEN") == 0) {
+                between_found = true;
+            } else if (strcasecmp(value, "AND") == 0 && between_found) {
+                between_found = false; //Dit is de AND van de BETWEEN, die blijft op dezelfde regel.
+            } else if (strcasecmp(value, "AND") == 0 || strcasecmp(value, "OR") == 0) {
                 *pos += sprintf(result + *pos, "\n");
                 add_indentation(result, pos, 1);
-                *pos += sprintf(result + *pos, "%s ", uppercase_value);
-                new_condition = true;
-            } else {
-                *pos += sprintf(result + *pos, "%s ", uppercase_value);
+                write_token(tokens, i, result, pos);
+                continue;
             }
-        } else if (tokens[i].type != TOKEN_KEYWORD) {
-            *pos += sprintf(result + *pos, "%s ", tokens[i].raw_value);
         }
+
+        if (is_open_parenthesis(tokens, i)) {
+            depth++;
+        } else if (is_close_parenthesis(tokens, i)) {
+            depth--;
+        }
+        write_token(tokens, i, result, pos);
     }
     *pos += sprintf(result + *pos, "\n\n");
-
-    free(uppercase_value);
 }
 
 
@@ -318,80 +392,56 @@ unsigned int format_comments(Token* tokens, int start_idx, int max_i, char* resu
     return skipped_tokens;
 }
 
-unsigned int format_case_block(Token* tokens, int start_idx, int max_i, char* result, size_t* pos, 
-                                int *item_number, int indentation) {
-    /* Speciale functie die case-when blocks schrijft. Return het aantal geskipte tokens */
+unsigned int format_case_block(Token* tokens, int start_idx, int max_i, char* result, size_t* pos, int indentation) {
+    /* Speciale functie die case-when blocks schrijft. Begint op de CASE token.
+    Return het aantal geschreven tokens (tot en met de END). */
     int i = start_idx;
-    unsigned int skipped_tokens = 0;
-    int in_case_block = 1;
-    char* uppercase_value = to_uppercase(tokens[i].value);
-    
-    if (strcmp(uppercase_value, "CASE") == 0) {
-        if (*item_number > 1) {
-            *pos += sprintf(result + *pos, "\n");
-            add_indentation(result, pos, indentation);
-            *pos += sprintf(result + *pos, ",%s", tokens[i].value);
-        } else {
-            *pos += sprintf(result + *pos, "\n");
-            add_indentation(result, pos, indentation);
-            *pos += sprintf(result + *pos, " %s", tokens[i].value);
-        }
-        i++;
-        skipped_tokens++;
-    }
-    
-    while (in_case_block && i < max_i) {
-        free(uppercase_value);
-        uppercase_value = to_uppercase(tokens[i].value);
-        
-        if (tokens[i].type == TOKEN_COMMENT) {
-            skipped_tokens += format_comments(tokens, i, max_i, result, pos);
-            i += skipped_tokens;
+    int depth = 0;
+
+    write_token(tokens, i, result, pos); //De CASE zelf
+    i++;
+
+    while (i <= max_i) {
+        const char* value = tokens[i].value;
+
+        if (depth == 0 && strcasecmp(value, "CASE") == 0) {
+            // Case in een case, die springt een niveau verder in.
+            i += format_case_block(tokens, i, max_i, result, pos, indentation + 1);
             continue;
         }
-        
-        if (strcmp(uppercase_value, "WHEN") == 0 || strcasecmp(tokens[i].value, "ELSE") == 0) {
+
+        if (depth == 0 && (strcasecmp(value, "WHEN") == 0 || strcasecmp(value, "ELSE") == 0)) {
             // Voor when en else, een nieuwe lijn met tabjes
             *pos += sprintf(result + *pos, "\n");
             add_indentation(result, pos, indentation + 1);
-            *pos += sprintf(result + *pos, "%s ", tokens[i].value);
-        } else if (strcmp(uppercase_value, "THEN") == 0) {
-            // THEN statements allemaal op 1 lijn
-            *pos += sprintf(result + *pos, " %s ", tokens[i].value);
-        } else if (strcmp(uppercase_value, "END") == 0) {
-            // Klaar met case block, terug naar normale indentatie.
-            in_case_block = 0;
+            write_token(tokens, i, result, pos);
+        } else if (depth == 0 && strcasecmp(value, "END") == 0) {
+            // Klaar met case block, END op dezelfde hoogte als de WHEN.
             *pos += sprintf(result + *pos, "\n");
-            add_indentation(result, pos, indentation);
-            *pos += sprintf(result + *pos, "%s", tokens[i].value);
+            add_indentation(result, pos, indentation + 1);
+            write_token(tokens, i, result, pos);
+            i++;
+            break;
         } else {
             // De rest op 1 lijn.
-            *pos += sprintf(result + *pos, "%s ", tokens[i].value);
+            if (is_open_parenthesis(tokens, i)) {
+                depth++;
+            } else if (is_close_parenthesis(tokens, i)) {
+                depth--;
+            }
+            write_token(tokens, i, result, pos);
         }
-        
+
         i++;
-        skipped_tokens++;
     }
-    
-    free(uppercase_value);
-    return skipped_tokens;
+
+    return i - start_idx;
 }
 
 
 
-const char* format_sql(Token** tokens, unsigned int token_count) {
-    /*Functie die blokken select statements formateert*/
-    if (!tokens || !*tokens || token_count == 0) {
-        return "Error: Invalid tokens array\n";
-    }
-
-    char* result = malloc(7200000 * sizeof(char));
-    if (!result) {
-        return "Error: Memory allocation failed\n";
-    }
-    
-    size_t pos = 0;
-    Token* token_array = *tokens;
+void format_sql(Token* token_array, int start_idx, int end_idx, char* result, size_t* pos) {
+    /*Functie die een blok select statement formateert. Het blok begint altijd met de SELECT.*/
     
     // Maak onze clause array met specifieke functie voor elke clause. 
     SQLClause clauses[] = {
@@ -407,55 +457,47 @@ const char* format_sql(Token** tokens, unsigned int token_count) {
     const int num_clauses = sizeof(clauses) / sizeof(clauses[0]);
 
     // Nu gaan we kijken waar de clauses zijn.
-    // We knippen dit in twee stapjes op omdat we anders het probleem krijgen dat de specifieke volgorde
-    // in onze array met clauses niet gevolgd wordt. 
-    // In de eerste pass kijken we louter waar elk keyword begint
-    int in_curly_braces = 0;
-    for (int i = 0; i < token_count; i++) {
-        // printf("Token: %s\n", token_array[i].value);
-
-        if (strstr(token_array[i].value, "(") != NULL) {
-            in_curly_braces = 1;
+    // In de eerste pass kijken we louter waar elk keyword begint.
+    // Keywords tussen haakjes (subqueries, OVER (ORDER BY ...)) tellen niet mee.
+    int depth = 0;
+    for (int i = start_idx; i <= end_idx; i++) {
+        if (is_open_parenthesis(token_array, i)) {
+            depth++;
+        } else if (is_close_parenthesis(token_array, i)) {
+            depth--;
         }
         
-        //Probleem dat we geen innerqueries meer kunnen doen, op hoger niveau oplossen
-        //We willen niet dat een order by in een over functie problemen oplevert.
-        if (token_array[i].type == TOKEN_KEYWORD && !in_curly_braces ) { 
-            const char* uppercase_value = to_uppercase(token_array[i].value);
-            
+        if (token_array[i].type == TOKEN_KEYWORD && depth == 0) { 
             for (int j = 0; j < num_clauses; j++) {
-                if (strcmp(uppercase_value, clauses[j].keyword) == 0) {
-                    // printf("Found keyword %s at position %d\n", clauses[j].keyword, i);
-                    
+                if (strcasecmp(token_array[i].value, clauses[j].keyword) == 0) {
+                    if (clauses[j].start_pos != -1) {
+                        break; //Alleen de eerste keer telt, anders raken we het stuk ervoor kwijt.
+                    }
                     if (clauses[j].second_word != NULL) {
-                        if (i + 1 < token_count && 
-                            strcmp(to_uppercase(token_array[i + 1].value), clauses[j].second_word) == 0) {
+                        if (i + 1 <= end_idx && 
+                            strcasecmp(token_array[i + 1].value, clauses[j].second_word) == 0) {
                             clauses[j].start_pos = i + 2;
-                            // printf("Setting start of %s %s to %d\n", clauses[j].keyword, clauses[j].second_word, i + 2);
                             i++;
                         }
                     } else {
                         clauses[j].start_pos = i + 1;
-                        // printf("Setting start of %s to %d\n", clauses[j].keyword, i + 1);
                     }
                     break;
                 }
             }
         }
-        if (strstr(token_array[i].value, ")") != NULL ) {
-            in_curly_braces = 0;
-        }
     }
 
-    // Tweede pas kijken waar alle clauses eindigen
+    // Tweede pas kijken waar alle clauses eindigen: net voor het keyword van de clause die er in de tekst op volgt.
     for (int i = 0; i < num_clauses; i++) {
         if (clauses[i].start_pos != -1) {
-            // Hier vinden we de volgende clause die daadwerkelijke bestaat
-            int end_pos = token_count - 1;  // De default waarde is het einde van ozne volledige statement.
-            for (int j = i + 1; j < num_clauses; j++) {
-                if (clauses[j].start_pos != -1) {
-                    end_pos = clauses[j].start_pos - 2;
-                    break;
+            int end_pos = end_idx;  // De default waarde is het einde van ons volledige statement.
+            for (int j = 0; j < num_clauses; j++) {
+                if (clauses[j].start_pos > clauses[i].start_pos) {
+                    int keyword_pos = clauses[j].start_pos - (clauses[j].second_word != NULL ? 2 : 1);
+                    if (keyword_pos - 1 < end_pos) {
+                        end_pos = keyword_pos - 1;
+                    }
                 }
             }
             clauses[i].end_pos = end_pos;
@@ -463,24 +505,29 @@ const char* format_sql(Token** tokens, unsigned int token_count) {
         }
     }
 
-    // Vervolgens formatteren we elke clause die we gevonden hebben.
-    for (int i = 0; i < num_clauses; i++) {
-        if (clauses[i].start_pos != -1 && clauses[i].end_pos != -1) {
-            if (clauses[i].format_keyword) {
-                format_select_section(token_array, clauses[i].start_pos, 
-                                    clauses[i].end_pos, result, &pos, 
-                                    clauses[i].format_keyword);
-                // printf("Current result adding select is: %s", result);
-            } else {
-                clauses[i].format_func(token_array, clauses[i].start_pos, 
-                                     clauses[i].end_pos, result, &pos);
-                // printf("Current result adding others is: %s", result);
+    // Vervolgens formatteren we elke clause die we gevonden hebben, in de volgorde waarin ze in de tekst staan.
+    int last_start = -1;
+    for (int n = 0; n < num_clauses; n++) {
+        int i = -1;
+        for (int j = 0; j < num_clauses; j++) {
+            if (clauses[j].start_pos > last_start && (i == -1 || clauses[j].start_pos < clauses[i].start_pos)) {
+                i = j;
             }
         }
-    }
+        if (i == -1) {
+            break;
+        }
+        last_start = clauses[i].start_pos;
 
-    // printf("Output is: %s\n", result);
-    return result;
+        if (clauses[i].format_keyword) {
+            format_select_section(token_array, clauses[i].start_pos, 
+                                clauses[i].end_pos, result, pos, 
+                                clauses[i].format_keyword);
+        } else {
+            clauses[i].format_func(token_array, clauses[i].start_pos, 
+                                 clauses[i].end_pos, result, pos);
+        }
+    }
 }
 
 
@@ -583,152 +630,139 @@ char* apply_parenthesis_indentation(const char* input) {
 }
 
 
-const char* preprocess_format_postprocess(Token** tokens, unsigned int token_count) {
-    if (!tokens || !*tokens || token_count == 0) {
-        return "Error: Invalid tokens array\n";
-    }
-
-    char* final_result = malloc(7200000 * sizeof(char));
-    if (!final_result) {
-        return "Error: Memory allocation failed\n";
-    }
-
-    char *uppercase_value = malloc(1000 * sizeof(char));
-    if (!uppercase_value) {
-        perror("Error: Memory allocation failed\n");
-    }
-    char *uppercase_value_2 = malloc(1000 * sizeof(char));
-    if (!uppercase_value_2) {
-        perror("Error: Memory allocation failed\n");
-    }
-
-
-    Token* token_array = *tokens;
-    size_t final_pos = 0;
-    size_t current_pos = 0;
-    int in_curly_brackets = 0;
+void format_statements(Token* token_array, int start_idx, int end_idx, char* result, size_t* pos) {
+    /* Formatteert een reeks statements. Select blokken gaan naar format_sql, de rest schrijven we zoals het er staat. */
 
     // Keywords die ons moeten stoppen om een select statement in te lezen. 
     const char* stop_words[] = {"DROP", "CREATE", "ALTER", "SELECT", "UPDATE", 
                                 "INSERT", "WITH", "USE", "DELETE", "UNION", "LIMIT",
                                 "OFFSET", NULL};
 
-    while (current_pos < token_count) {
-        free(uppercase_value);
-        uppercase_value = to_uppercase(token_array[current_pos].value);
-        if (token_array[current_pos].type == TOKEN_COMMENT) {
-            int line_difference = token_array[current_pos].line_number - token_array[current_pos - 1].line_number;
-            for (int i = 0; i < line_difference; i++) {
-                strcat(final_result + final_pos, "\n");
-                final_pos++;
-            }
-            Token* token_array = *tokens;
-            current_pos += format_comments(token_array, current_pos, token_count, final_result, &final_pos);
-        }
+    int current_pos = start_idx;
+    int depth = 0;
+
+    while (current_pos <= end_idx) {
         // Kijk of de huidige token een select is.
-        // printf("Huidige pos: %d \n", current_pos);
-        if (strcmp(uppercase_value, "SELECT") == 0 && token_array[current_pos].type == TOKEN_KEYWORD) {
-            unsigned int select_start = current_pos;
+        if (strcasecmp(token_array[current_pos].value, "SELECT") == 0 && token_array[current_pos].type == TOKEN_KEYWORD) {
+            int select_start = current_pos;
+            int select_depth = 0;
             
             // Vind het einde van de huidige select statement.
-            while (current_pos < token_count) {
-                free(uppercase_value);
-                uppercase_value = to_uppercase(token_array[current_pos].value);
+            while (current_pos <= end_idx) {
+                if (is_open_parenthesis(token_array, current_pos)) {
+                    select_depth++;
+                } else if (is_close_parenthesis(token_array, current_pos)) {
+                    select_depth--;
+                    if (select_depth < 0) {
+                        break; //Een haakje dat we niet zelf geopend hebben, dat is niet van ons.
+                    }
+                }
                 
                 // Ook een check of we toevallig een puntkomma vinden. Lang leve afwijkinge van de SQL standard. 
-                if (strcmp(token_array[current_pos].value, ";") == 0) {
+                if (select_depth == 0 && token_array[current_pos].type == TOKEN_SEMICOLON) {
                     current_pos++;
                     break;
                 }
                 
-                // Kijk of we een stop woord hebben gevonden
+                // Kijk of we een stop woord hebben gevonden, alleen buiten haakjes en nadat je de eerste select passeert
                 int found_stop = 0;
-                if (current_pos > select_start) {  // Check alleen nadat je de eerste select passeert
+                if (current_pos > select_start && select_depth == 0 && token_array[current_pos].type == TOKEN_KEYWORD) {
                     for (const char** stop = stop_words; *stop != NULL; stop++) {
-                        if (strcmp(uppercase_value, *stop) == 0 && token_array[current_pos].type == TOKEN_KEYWORD) {
+                        if (strcasecmp(token_array[current_pos].value, *stop) == 0) {
                             found_stop = 1;
                             break;
                         }
                     }
-
-                    if (strcmp(uppercase_value, ")") == 0 && in_curly_brackets == 1) {
-                        in_curly_brackets -= 1;
-                        // current_pos++;
-                        break; //Breek uit als we eerder een curly bracket hadden en we dat weer tegencomen
-
-                    }
-
-                    if (found_stop) {
-                        break;  // Niet de huidige positie incrementeren; we willen deze namelijk weer kunnen verwerken
-                    }
+                }
+                if (found_stop) {
+                    break;  // Niet de huidige positie incrementeren; we willen deze namelijk weer kunnen verwerken
                 }
                 
                 current_pos++;
             }
-            
 
+            // Formateer ons gevonden select block, met een witregel ervoor.
+            ensure_newlines(result, pos, 2);
+            format_sql(token_array, select_start, current_pos - 1, result, pos);
 
-            // Formateer ons gevonden select block
-            unsigned int block_size = current_pos - select_start;
-            Token* block_tokens = &token_array[select_start];
-            const char* formatted_sql = format_sql(&block_tokens, block_size);
-            
-            // Zet onze geformatte block achterin onze resultaten.
-            size_t formatted_length = strlen(formatted_sql);
-            if (final_pos + formatted_length < 7200000) {
-                strcpy(final_result + final_pos, formatted_sql);
-                final_pos += formatted_length;
-            }
+        } else if (is_subquery_start(token_array, current_pos, end_idx)) {
+            // Bijvoorbeeld de body van een CTE: WITH x AS ( SELECT ... )
+            current_pos = format_subquery(token_array, current_pos, end_idx, result, pos, 0) + 1;
+
         } else {
-            // Als we een non select keyword hebben schrijven we tot het volgende keyword. 
-            while (current_pos < token_count) {
-                const char* current_value = token_array[current_pos].value;
-                const char* uppercase_value_2 = to_uppercase(token_array[current_pos].value);
-
-                if (strcmp(current_value, "(") == 0) {
-                    in_curly_brackets += 1;
-                }
-
-                // Kijken of we 1 van onze stop words hebben gevonden.
-                if (token_array[current_pos].type == TOKEN_KEYWORD) {
-                    int found_stop = 0;
-                    for (const char** stop = stop_words; *stop != NULL; stop++) {
-                        if (strcmp(uppercase_value_2, *stop) == 0) {
-                            found_stop = 1;
-                            break;
-                        }
-                    }
-                    if (found_stop) { //Als we een stopwoord hebben gevonden, dan beeindigen, verder verwerken
-                        if(strcmp(uppercase_value_2, "SELECT") == 0) {
-                            strcat(final_result + final_pos, "\n\n");
-                            final_pos += 2;
-                            break;
-                        }
-                        //Als we geen select hebben gevonden als stopwoord, dan enter, inserten, spatie en verder. 
-                        strcat(final_result + final_pos, "\n");
-                        final_pos++;
-                        strcat(final_result + final_pos, current_value);
-                        strcat(final_result + final_pos, " ");
-                        final_pos += strlen(current_value) + 1;
-                        current_pos++;
-                        break;  
+            // Als we een non select keyword hebben schrijven we het gewoon weg. Stopwoorden beginnen op een nieuwe regel.
+            int found_stop = 0;
+            if (depth == 0 && token_array[current_pos].type == TOKEN_KEYWORD) {
+                for (const char** stop = stop_words; *stop != NULL; stop++) {
+                    if (strcasecmp(token_array[current_pos].value, *stop) == 0) {
+                        found_stop = 1;
+                        break;
                     }
                 }
-                
-                // Voeg teken op het einde toe en plaats een spatie erachter
-                if (final_pos + strlen(current_value) + 1 < 7200000) {
-                    strcat(final_result + final_pos, current_value);
-                    strcat(final_result + final_pos, " ");
-                    final_pos += strlen(current_value) + 1;
-                    
-                }
-                
-                current_pos++;
             }
+            if (found_stop) {
+                ensure_newlines(result, pos, 1);
+            }
+            if (*pos > 0 && result[*pos - 1] == '\n') {
+                add_indentation(result, pos, 0);
+            }
+
+            if (is_open_parenthesis(token_array, current_pos)) {
+                depth++;
+            } else if (is_close_parenthesis(token_array, current_pos)) {
+                depth--;
+            }
+            write_token(token_array, current_pos, result, pos);
+            current_pos++;
         }
     }
-    // Stop een paar mooie tabjes om de code wat te verfrissen. 
-    final_result = apply_parenthesis_indentation(final_result);
+}
+
+
+const char* preprocess_format_postprocess(Token** tokens, unsigned int token_count) {
+    if (!tokens || !*tokens) {
+        return "Error: Invalid tokens array\n";
+    }
+    if (token_count == 0) {
+        return ""; //Leeg bestand in, leeg bestand uit.
+    }
+
+    Token* token_array = *tokens;
+
+    // Bereken hoeveel ruimte we maximaal nodig hebben. Per token komen er hooguit een paar enters, 
+    // een keyword en inspringing bij, en die inspringing hangt af van hoe diep de haakjes en cases genest zijn.
+    size_t buffer_size = 1;
+    int depth = 0;
+    int max_depth = 0;
+    for (unsigned int i = 0; i < token_count; i++) {
+        buffer_size += token_array[i].raw_length;
+        if (is_open_parenthesis(token_array, i) || strcasecmp(token_array[i].value, "CASE") == 0) {
+            depth++;
+        } else if ((is_close_parenthesis(token_array, i) || strcasecmp(token_array[i].value, "END") == 0) && depth > 0) {
+            depth--;
+        }
+        if (depth > max_depth) {
+            max_depth = depth;
+        }
+    }
+    buffer_size += (size_t)token_count * (16 + 8 * (max_depth + 4));
+
+    char* final_result = malloc(buffer_size * sizeof(char));
+    if (!final_result) {
+        return "Error: Memory allocation failed\n";
+    }
+
+    size_t final_pos = 0;
+    base_indentation = 0;
+    line_comment_open = 0;
+    format_statements(token_array, 0, token_count - 1, final_result, &final_pos);
+
+    // Netjes afsluiten met precies 1 enter.
+    while (final_pos > 0 && (final_result[final_pos - 1] == '\n' || final_result[final_pos - 1] == ' ')) {
+        final_pos--;
+    }
+    final_result[final_pos++] = '\n';
+    final_result[final_pos] = '\0';
     return final_result;
 }
 

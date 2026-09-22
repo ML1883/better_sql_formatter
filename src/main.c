@@ -51,10 +51,10 @@ int main(int argc, char *argv[]) {
     }
 
     unsigned int token_count = 0;
-    strcat(sql_file.content, " "); 
-    find_possible_tokens(sql_file.content, &tokens, &token_count);
+    find_possible_tokens(sql_file.content, &tokens, (int *)&token_count);
 
-    char* result_format = malloc(sizeof(char) * 7200000);
+    const char* formatted = preprocess_format_postprocess(&tokens, token_count);
+    char* result_format = malloc(sizeof(char) * (strlen(formatted) + 1));
     if (!result_format) {
         free_file_content(&sql_file);
         free(tokens);
@@ -62,7 +62,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    strcpy(result_format, preprocess_format_postprocess(&tokens, token_count));
+    strcpy(result_format, formatted);
 
     FileStatus write_error = write_file(output_filename, result_format);
     if (write_error != FILE_OK) {

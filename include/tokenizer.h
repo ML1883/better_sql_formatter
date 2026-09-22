@@ -25,6 +25,7 @@ typedef struct {
     unsigned int line_number;
     size_t length;
     size_t raw_length;
+    int space_before; //Stond er in het origineel witruimte voor deze token?
 } Token;
 
 void find_possible_tokens(const char *input, Token **tokens, int *token_count);
