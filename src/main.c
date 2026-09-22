@@ -42,40 +42,25 @@ int main(int argc, char *argv[]) {
     strcpy(output_filename, prefix);
     strcat(output_filename, input_filename);
 
-    Token *tokens = malloc(sizeof(Token));
-    if (!tokens) {
-        free_file_content(&sql_file);
-        free(output_filename);
-        perror("Failed to allocate memory for tokens");
-        return 1;
+    Token *tokens = NULL;
+    int token_count = 0;
+    char* result_format = NULL;
+    // Als het geheugen op is schrijven we niks weg, anders krijg je een half bestand.
+    FileStatus write_error = FILE_ERROR_MEMORY;
+    if (find_possible_tokens(sql_file.content, &tokens, &token_count)
+        && (result_format = preprocess_format_postprocess(tokens, token_count)) != NULL) {
+        write_error = write_file(output_filename, result_format);
     }
-
-    unsigned int token_count = 0;
-    find_possible_tokens(sql_file.content, &tokens, (int *)&token_count);
-
-    const char* formatted = preprocess_format_postprocess(&tokens, token_count);
-    char* result_format = malloc(sizeof(char) * (strlen(formatted) + 1));
-    if (!result_format) {
-        free_file_content(&sql_file);
-        free(tokens);
-        free(output_filename);
-        return 1;
-    }
-
-    strcpy(result_format, formatted);
-
-    FileStatus write_error = write_file(output_filename, result_format);
     if (write_error != FILE_OK) {
         fprintf(stderr, "Error writing output: %s\n", get_file_error_message(write_error));
     }
 
     free_file_content(&sql_file);
-    for (unsigned int i = 0; i < token_count; i++) {
+    for (int i = 0; i < token_count; i++) {
         if (verbose) {
-            printf("Token %d: value='%s', raw_value='%s', type=%d, line=%u\n", 
-                i, 
-                tokens[i].value, 
-                tokens[i].raw_value, 
+            printf("Token %d: value='%s', type=%d, line=%u\n",
+                i,
+                tokens[i].value,
                 tokens[i].type,
                 tokens[i].line_number);
         }
@@ -86,5 +71,5 @@ int main(int argc, char *argv[]) {
     free(result_format);
     free(output_filename);
 
-    return 0;
+    return write_error == FILE_OK ? 0 : 1;
 }
